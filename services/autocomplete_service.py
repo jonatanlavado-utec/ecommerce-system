@@ -24,10 +24,12 @@ class AutocompleteService:
         self._indexed = True
 
     def _build_trie(self) -> None:
-        """Build Trie from all products."""
+        """Build Trie from all products (optimized for batching)."""
         self.trie = Trie()
         for product in self.products:
             self.trie.insert(product.id, product.name, product.sales)
+        # Sort all nodes once after all inserts (O(n + total_nodes*k*log k) vs O(n*k*log k))
+        self.trie._sort_all_nodes()
         self._indexed = True
 
     def autocomplete_optimized(self, query: str, limit: int = 10) -> list[dict]:

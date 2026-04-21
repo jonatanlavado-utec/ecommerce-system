@@ -1,6 +1,7 @@
 """Search service with B+ Tree simulation and linear search."""
 
 from typing import Optional
+from collections import defaultdict
 from sortedcontainers import SortedDict
 from models.models import Product
 
@@ -30,13 +31,14 @@ class SearchService:
         self._indexed = True
 
     def _build_b_plus_tree(self) -> None:
-        """Build B+ Tree index from all products."""
-        self.b_plus_tree = SortedDict()
+        """Build B+ Tree index from all products (optimized for batching)."""
+        # Use defaultdict for faster bulk collection
+        temp_dict = defaultdict(list)
         for product in self.products:
             key = product.sku.lower()
-            if key not in self.b_plus_tree:
-                self.b_plus_tree[key] = []
-            self.b_plus_tree[key].append(product)
+            temp_dict[key].append(product)
+        # Bulk convert to SortedDict for efficient tree structure
+        self.b_plus_tree = SortedDict(temp_dict)
         self._indexed = True
 
     def search_by_sku_optimized(self, sku_query: str) -> list[Product]:

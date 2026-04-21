@@ -1,7 +1,6 @@
 """Fraud detection service with Bloom Filter and Hash Set."""
 
 from structures.bloom_filter import BloomFilter
-from models.models import Product
 
 
 class FraudService:
@@ -18,13 +17,15 @@ class FraudService:
         self._bloom_size = bloom_size
 
     def index_transactions(self, transaction_ids: list[str]) -> None:
-        """Index transaction IDs for fraud detection (batch)."""
+        """Index transaction IDs for fraud detection (batch optimized)."""
         self.transaction_ids = transaction_ids
-        self.bloom_filter = BloomFilter(size=self._bloom_size, num_hashes=7)
-        self.hash_set = set()
-        for txn_id in transaction_ids:
-            self.bloom_filter.add(txn_id)
-            self.hash_set.add(txn_id)
+        # Size bloom filter based on input size for optimal false positive rate
+        optimal_size = max(self._bloom_size, len(transaction_ids) * 10)
+        self.bloom_filter = BloomFilter(size=optimal_size, num_hashes=7)
+        # Build hash set first (O(n)), then add to bloom filter in bulk
+        self.hash_set = set(transaction_ids)  # O(n) bulk set creation
+        for txn_id in self.hash_set:
+            self.bloom_filter.add(txn_id)  # Still O(n * num_hashes) but faster overall
         self._indexed = True
 
     def add_transaction(self, txn_id: str) -> None:
