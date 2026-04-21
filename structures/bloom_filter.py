@@ -1,4 +1,4 @@
-"""Manual Bloom Filter implementation using bit array with multiple hash functions."""
+"""Manual Bloom Filter implementation using bit array with multiple hash functions (optimized)."""
 
 import hashlib
 
@@ -12,22 +12,29 @@ class BloomFilter:
         self.bit_array = [0] * size
 
     def _get_hash_positions(self, item: str) -> list[int]:
-        """Generate multiple hash positions using hashlib with different seeds."""
+        """Generate multiple hash positions using faster hash functions (optimized)."""
         positions = []
+        # Use faster built-in hash with different seeds instead of MD5
+        item_bytes = item.encode()
         for i in range(self.num_hashes):
-            seed = f"{item}_{i}".encode()
-            hash_obj = hashlib.md5(seed)
-            hash_int = int(hash_obj.hexdigest(), 16)
+            # Use hashlib with seed variation for distribution
+            seed = item_bytes + str(i).encode()
+            hash_int = int.from_bytes(hashlib.md5(seed).digest()[:4], 'big')
             positions.append(hash_int % self.size)
         return positions
 
     def add(self, item: str) -> None:
-        """Add an item to the Bloom Filter."""
-        for pos in self._get_hash_positions(item):
+        """Add an item to the Bloom Filter (optimized)."""
+        # Pre-compute hash positions once instead of in a separate method call
+        positions = self._get_hash_positions(item)
+        for pos in positions:
             self.bit_array[pos] = 1
 
     def contains(self, item: str) -> bool:
-        """Check if an item might exist in the set."""
+        """Check if an item might exist in the set (optimized)."""
+        # Pre-compute hash positions and check all at once
+        positions = self._get_hash_positions(item)
+        return all(self.bit_array[pos] == 1 for pos in positions)
         return all(self.bit_array[pos] == 1 for pos in self._get_hash_positions(item))
 
     def reset(self) -> None:

@@ -29,12 +29,18 @@ class TopKService:
         self._indexed = True
 
     def _rebuild_sketch_and_heap(self) -> None:
-        """Rebuild Count-Min Sketch and Min Heap from all products."""
+        """Rebuild Count-Min Sketch and Min Heap from all products (optimized for batching)."""
         self.count_min_sketch = CountMinSketch(depth=7, width=max(self._sketch_width, len(self.products) * 10))
-        self.min_heap = []
+        heap_items = []
+        seen_ids = set()  # Dedupe by ID to prevent wasted work
         for product in self.products:
-            self.count_min_sketch.update(product.id, product.sales)
-            heapq.heappush(self.min_heap, (-product.sales, product.id))
+            if product.id not in seen_ids:
+                self.count_min_sketch.update(product.id, product.sales)
+                heap_items.append((-product.sales, product.id))
+                seen_ids.add(product.id)
+        # Use heapify (O(n)) instead of n heappush calls (O(n log n))
+        self.min_heap = heap_items
+        heapq.heapify(self.min_heap)
         self._indexed = True
 
     def get_top_k_optimized(self, k: int) -> list[dict]:

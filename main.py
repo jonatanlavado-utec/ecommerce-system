@@ -218,49 +218,39 @@ async def init_dataset(
     # Collect product_ids for order generation
     chunk_count = 0
 
-    # STEP 1: Generate and index products incrementally
-    for i, product in enumerate(generate_products(products)):
-        products_list.append(product)
-        product_ids.append(product.id)
+    # STEP 1: Collect all products into a list (consume generator fully)
+    products_list = list(generate_products(products))
+    product_ids = [p.id for p in products_list]  # For order generation
 
-        # Index into search service (B+ Tree)
-        app_state["search_service"].add_product(product)
-        # Index into autocomplete service (Trie)
-        app_state["autocomplete_service"].add_product(product)
-        # Index into topk service (Count-Min + MinHeap)
-        app_state["topk_service"].add_product(product)
-
-        chunk_count += 1
-        if chunk_count >= chunk_size:
-            chunk_count = 0
+    # Batch index products into services (replaces incremental loop)
+    app_state["search_service"].index_products(products_list)        # Builds B+ Tree in one pass
+    app_state["autocomplete_service"].index_products(products_list)  # Builds Trie in one pass
+    app_state["topk_service"].index_products(products_list)          # Builds Count-Min Sketch + Heap in one pass
 
     app_state["products"] = products_list
 
-    # STEP 2: Generate transactions and index into fraud service
-    # Only store transaction IDs for fraud detection
-    chunk_count = 0
-    txn_chunk = []
-
-    for txn in generate_transactions(transactions):
+    # STEP 2: Collect all transactions and orders into lists (batch mode)
+    transaction_ids = []
+    orders_list = []
+    
+    for txn in generate_transactions(transactions):  # Loop only to collect data
         transaction_ids.append(txn.id)
-        app_state["fraud_service"].add_transaction(txn.id)
-        txn_chunk.append(txn)
-
-        # Also generate order from purchase transactions
+        
+        # Generate order from purchase transactions
         if txn.transaction_type == 'purchase':
+            rank = len(orders_list)
             order = Order(
                 id=txn.id,
                 customer_id=txn.user_id,
-                product_ids=[product_ids[i % len(product_ids)]],
-                priority=OrderPriority(rank % 3 + 1) if (rank := len(orders_list)) < 1000000 else OrderPriority.STANDARD,
+                product_ids=[product_ids[rank % len(product_ids)]],
+                priority=OrderPriority(rank % 3 + 1) if rank < 1000000 else OrderPriority.STANDARD,
                 total=txn.amount
             )
-            app_state["order_service"].add_order(order)
             orders_list.append(order)
-
-        chunk_count += 1
-        if chunk_count >= chunk_size:
-            chunk_count = 0
+    
+    # Batch index transactions and orders (replaces incremental loop)
+    app_state["fraud_service"].index_transactions(transaction_ids)  # Builds Bloom Filter + Hash Set in one pass
+    app_state["order_service"].index_orders(orders_list)            # Builds priority heap in one pass
 
     # Store app state
     app_state["initialized"] = True
@@ -345,55 +335,63 @@ async def init_dataset_async(
             orders_list = []
             product_ids = []
 
-            # STEP 1: Generate and index products
+            # STEP 1: Collect and batch index products
+            print('### START PRODUCTS')
             app_state["init_progress"]["phase"] = "products"
-            for i, product in enumerate(generate_products(products)):
-                products_list.append(product)
-                product_ids.append(product.id)
+            products_list = list(generate_products(products))  # Collect all at once
+            product_ids = [p.id for p in products_list]
+            print('### START INDEX')
 
-                app_state["search_service"].add_product(product)
-                app_state["autocomplete_service"].add_product(product)
-                app_state["topk_service"].add_product(product)
+            # Batch index (replaces incremental loop)
+            app_state["search_service"].index_products(products_list)
+            print('### FINISH INDEX SEARCH')
 
-                app_state["init_progress"]["products_done"] = i + 1
-
-                if i > 0 and i % 1000 == 0:
-                    app_state["init_progress"]["phase"] = f"products:{i // 1000}"
-                    # Auto-save progress
-                    app_state["products"] = products_list
-                    save_state()
-                    print(f"[STATE] Auto-saved at {i} products")
-
+            app_state["autocomplete_service"].index_products(products_list)
+            print('### FINISH INDEX AUTOCOMPLETE')
+            app_state["topk_service"].index_products(products_list)
+            print('### FINISH INDEX TOPK')
+            
             app_state["products"] = products_list
+            app_state["init_progress"]["products_done"] = products  # Mark as complete
+            app_state["init_progress"]["phase"] = "products:done"
 
-            # STEP 2: Generate transactions
+            # STEP 2: Collect and batch index transactions/orders
+            print('### START TANSACTIONS')
             app_state["init_progress"]["phase"] = "transactions"
-            chunk_count = 0
+            transaction_ids = []
+            purchase_transactions = []  # Store only purchase transactions separately
+            product_ids_len = len(product_ids)  # Cache length - O(1) but repeated calls add up
+            product_ids_len_1m = 1000000  # Cache constant
 
+            # Single pass: collect all transaction IDs
             for txn in generate_transactions(transactions):
                 transaction_ids.append(txn.id)
-                app_state["fraud_service"].add_transaction(txn.id)
 
-                # Also generate order from purchase transactions
+                # Only collect purchase transactions (avoid creating Order objects yet)
                 if txn.transaction_type == 'purchase':
-                    order = Order(
-                        id=txn.id,
-                        customer_id=txn.user_id,
-                        product_ids=[product_ids[i % len(product_ids)]],
-                        priority=OrderPriority(rank % 3 + 1) if (rank := len(orders_list)) < 1000000 else OrderPriority.STANDARD,
-                        total=txn.amount
-                    )
-                    app_state["order_service"].add_order(order)
-                    orders_list.append(order)
+                    purchase_transactions.append(txn)
+            print('### START order TANSACTIONS')
+            # Batch create Order objects outside the generator loop (after all data collected)
+            orders_list = []
+            for rank, txn in enumerate(purchase_transactions):
+                order = Order(
+                    id=txn.id,
+                    customer_id=txn.user_id,
+                    product_ids=[product_ids[rank % product_ids_len]],
+                    priority=OrderPriority(rank % 3 + 1) if rank < product_ids_len_1m else OrderPriority.STANDARD,
+                    total=txn.amount
+                )
+                orders_list.append(order)
 
-                app_state["init_progress"]["transactions_done"] = txn.id.split('_')[1]
-                chunk_count += 1
-                if chunk_count >= 1000:
-                    chunk_count = 0
-                    app_state["init_progress"]["phase"] = f"transactions:{int(txn.id.split('_')[1]) // 1000}"
-                    # Auto-save progress
-                    save_state()
-                    print(f"[STATE] Auto-saved at {txn.id} transactions")
+            # Batch index (replaces incremental loop)
+            print('### START INDEX TRANSACTIONS')
+            app_state["fraud_service"].index_transactions(transaction_ids)
+            print('### FINISH INDEX FRAUD')
+            app_state["order_service"].index_orders(orders_list)
+            print('### FINISH INDEX ORDER')
+
+            app_state["init_progress"]["transactions_done"] = transactions  # Mark as complete
+            app_state["init_progress"]["phase"] = "done"
 
             # Mark as complete
             app_state["initialized"] = True
@@ -427,7 +425,7 @@ async def init_status():
     """
     Get initialization progress status.
     """
-    print(f"[STATUS] Request received - running: {app_state['init_progress']['running']}, initialized: {app_state['initialized']}")
+    # print(f"[STATUS] Request received - running: {app_state['init_progress']['running']}, initialized: {app_state['initialized']}")
     progress = app_state["init_progress"]
 
     return {
@@ -517,6 +515,41 @@ async def top_products(
         "results": results
     }
 
+
+@app.get("/api/products")
+async def get_products(
+    page: int = Query(default=1, ge=1, description="Número de página"),
+    page_size: int = Query(default=12, ge=1, le=100, description="Productos por página")
+):
+    """
+    Endpoint paginado para obtener la lista completa de productos.
+    Mantiene la estructura requerida por el frontend.
+    """
+    # 1. Verificar si el sistema está inicializado
+    if not app_state["initialized"]:
+        raise HTTPException(status_code=400, detail="Call /init first")
+
+    products_list = app_state["products"]
+    total_count = len(products_list)
+
+    # 2. Calcular índices de rebanado (slicing)
+    start = (page - 1) * page_size
+    end = start + page_size
+    
+    # 3. Obtener el segmento de la lista
+    items = products_list[start:end]
+
+    # 4. Construir la respuesta con el formato exacto de TypeScript
+    return {
+        "items": [
+            {"id": p.id, "sku": p.sku, "name": p.name, "price": p.price, "sales": p.sales}
+            for p in items
+        ],
+        "page": page,
+        "pageSize": page_size,
+        "total": total_count,
+        "hasMore": end < total_count
+    }
 
 @app.get("/api/fraud-check")
 async def fraud_check(
