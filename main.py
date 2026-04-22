@@ -62,6 +62,7 @@ app_state = {
     "topk_service": TopKService(),
     "fraud_service": FraudService(),
     "order_service": OrderService(),
+    "lsm_service": LSMDebugService(memtable_limit_mb=2.0),
     # Only store products list for linear search fallback
     "products": [],
     # Async initialization state
@@ -84,11 +85,17 @@ def save_state():
         STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
         temp_file = STATE_FILE.with_suffix('.tmp')
 
-        # Get transaction IDs from fraud service
         txn_ids = list(app_state["fraud_service"].hash_set) if hasattr(app_state["fraud_service"], "hash_set") else []
 
-        # Get order data
-        orders = app_state["order_service"].get_all_orders() if hasattr(app_state["order_service"], "get_all_orders") else []
+        # FIX: Extract the Order object (index 2) from the heap tuple (priority, counter, order)
+        raw_orders = app_state["order_service"].get_all_orders() if hasattr(app_state["order_service"], "get_all_orders") else []
+        orders = []
+        for item in raw_orders:
+            # If the service returns the raw heap tuple, take the 3rd element (the Order object)
+            if isinstance(item, tuple) and len(item) == 3:
+                orders.append(item[2])
+            else:
+                orders.append(item)
 
         data = {
             "initialized": app_state["initialized"],
@@ -96,19 +103,16 @@ def save_state():
             "transactions_count": app_state["transactions_count"],
             "products": app_state["products"],
             "transaction_ids": txn_ids,
-            "orders": orders,
+            "orders": orders, # Now saving clean Order objects
         }
 
         with open(temp_file, "wb") as f:
             pickle.dump(data, f)
 
-        # Atomic rename
         temp_file.rename(STATE_FILE)
         print(f"[STATE] Saved - products: {len(app_state['products'])}, txns: {len(txn_ids)}, orders: {len(orders)}")
     except Exception as e:
         print(f"[STATE] Save FAILED: {e}")
-        import traceback
-        traceback.print_exc()
 
 
 def load_state():
@@ -145,7 +149,9 @@ def load_state():
 
         # Rebuild order index (Priority Heap)
         for order in orders:
-            app_state["order_service"].add_order(order)
+            # Safety check: if 'order' is the heap tuple (priority, count, obj), unpack it
+            actual_order = order[2] if isinstance(order, tuple) and len(order) == 3 else order
+            app_state["order_service"].add_order(actual_order)
 
         # Set state
         app_state["initialized"] = data["initialized"]
@@ -299,6 +305,12 @@ async def init_dataset_async(
     Start async dataset initialization in background.
     Use /init-status to poll for progress.
     """
+    # 1. State: Already finished
+    if app_state["initialized"]:
+        return JSONResponse(
+            status_code=200,
+            content={"status": "ready", "message": "Dataset is already initialized."}
+        )
     print(f"[INIT] Starting async init - products: {products}, transactions: {transactions}")
     if app_state["init_progress"]["running"]:
         return JSONResponse(
@@ -335,6 +347,9 @@ async def init_dataset_async(
             orders_list = []
             product_ids = []
 
+            # Grab the real LSM Service from app state
+            lsm = app_state["lsm_service"]
+
             # STEP 1: Collect and batch index products
             print('### START PRODUCTS')
             app_state["init_progress"]["phase"] = "products"
@@ -350,6 +365,12 @@ async def init_dataset_async(
             print('### FINISH INDEX AUTOCOMPLETE')
             app_state["topk_service"].index_products(products_list)
             print('### FINISH INDEX TOPK')
+
+            # ---> ADDED: Push products to LSM Tree Tracker
+            print('### START LSM PRODUCTS')
+            for product in products_list:
+                lsm.insert(key=product.sku, size_bytes=150)
+            print('### FINISH LSM PRODUCTS')
             
             app_state["products"] = products_list
             app_state["init_progress"]["products_done"] = products  # Mark as complete
@@ -389,6 +410,12 @@ async def init_dataset_async(
             print('### FINISH INDEX FRAUD')
             app_state["order_service"].index_orders(orders_list)
             print('### FINISH INDEX ORDER')
+
+            # ---> ADDED: Push transactions to LSM Tree Tracker
+            print('### START LSM TRANSACTIONS')
+            for txn_id in transaction_ids:
+                lsm.insert(key=txn_id, size_bytes=60)
+            print('### FINISH LSM TRANSACTIONS')
 
             app_state["init_progress"]["transactions_done"] = transactions  # Mark as complete
             app_state["init_progress"]["phase"] = "done"
@@ -473,25 +500,21 @@ async def search_products(
 
 @app.get("/api/autocomplete")
 async def autocomplete(
-    q: str = Query(..., min_length=1, max_length=50, description="Autocomplete prefix"),
-    optimized: bool = Query(default=True, description="Use optimized Trie"),
-    limit: int = Query(default=10, ge=1, le=100, description="Max results")
+    q: str = Query(..., min_length=1, description="Prefix to search for"),
+    optimized: bool = Query(True, description="Use Trie vs Linear search")
 ):
-    """Autocomplete product names using Trie."""
+    """Get autocomplete suggestions for products."""
     if not app_state["initialized"]:
-        raise HTTPException(status_code=400, detail="Call /init first")
-
+        raise HTTPException(status_code=400, detail="System not initialized. Call /init first.")
+        
+    svc = app_state["autocomplete_service"]
+    
     if optimized:
-        results = app_state["autocomplete_service"].autocomplete_optimized(q, limit)
+        results = svc.autocomplete_optimized(q)
     else:
-        results = app_state["autocomplete_service"].autocomplete_linear(q, limit)
-
-    return {
-        "query": q,
-        "optimized": optimized,
-        "count": len(results),
-        "results": results
-    }
+        results = svc.autocomplete_linear(q)
+        
+    return results
 
 
 @app.get("/api/top-products")
@@ -551,25 +574,29 @@ async def get_products(
         "hasMore": end < total_count
     }
 
+# main.py - Update the /api/fraud-check endpoint
 @app.get("/api/fraud-check")
 async def fraud_check(
     n: int = Query(default=50, ge=1, le=10000, description="Number of transaction IDs to check"),
     optimized: bool = Query(default=True, description="Use optimized Bloom Filter")
 ):
-    """Check transaction IDs for fraud detection."""
     if not app_state["initialized"]:
         raise HTTPException(status_code=400, detail="Call /init first")
 
-    # Get random transaction IDs from the fraud service
-    import random
     stats = app_state["fraud_service"].get_fraud_stats()
     total_txns = stats["transactions_indexed"]
 
-    if total_txns == 0:
-        raise HTTPException(status_code=400, detail="No transactions indexed")
-
-    # Generate random transaction IDs to check
-    check_ids = [f"txn_{random.randint(0, total_txns):010d}" for _ in range(n)]
+    import random
+    check_ids = []
+    for _ in range(n):
+        # 80% chance of a valid ID, 20% chance of an "Unknown" (Fraud) ID
+        if random.random() > 0.20:
+            txn_num = random.randint(0, total_txns - 1)
+        else:
+            # Pick a number far outside the valid range
+            txn_num = total_txns + random.randint(999999, 999990009)
+        
+        check_ids.append(f"txn_{txn_num:010d}")
 
     if optimized:
         results = app_state["fraud_service"].is_fraudulent_optimized(check_ids)
@@ -620,15 +647,17 @@ async def benchmark():
 
 
 @app.get("/api/lsm-debug")
-async def lsm_debug():
-    """Get simulated LSM debug information."""
-    service = LSMDebugService()
-    state = service.generate_simulated_state()
-
+async def get_lsm_debug():
+    """Return the real-time state and log timeline of the LSM Tree."""
+    lsm = app_state.get("lsm_service")
+    
+    if not lsm:
+        return JSONResponse(status_code=500, content={"error": "LSM Service not initialized"})
+        
     return {
-        "description": "Simulated LSM (Log-Structured Merge) Tree state",
-        "lsm_state": state,
-        "timeline": service.get_timeline()
+        "description": "Real-time LSM Tree Architecture",
+        "lsm_state": lsm.get_state(),
+        "timeline": lsm.get_timeline()
     }
 
 
@@ -682,6 +711,21 @@ async def debug_state():
         }
     }
 
+# ... Add this endpoint definition ...
+@app.get("/api/benchmark-comparisons")
+async def get_benchmark_comparisons():
+    """Run dynamic scaling benchmarks across all services and return chart data."""
+    if not app_state["initialized"]:
+        raise HTTPException(status_code=400, detail="Call /init first to populate data")
+        
+    try:
+        benchmark_svc = BenchmarkService(app_state)
+        # This takes about 1-3 seconds to run dynamically depending on your CPU
+        comparisons = benchmark_svc.run_scaling_comparisons()
+        return JSONResponse(content=comparisons)
+    except Exception as e:
+        print(f"Benchmark error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/reset")
 async def reset_state():
@@ -702,6 +746,7 @@ async def reset_state():
         "topk_service": TopKService(),
         "fraud_service": FraudService(),
         "order_service": OrderService(),
+        "lsm_service": LSMDebugService(memtable_limit_mb=2.0),
         "products": [],
         "init_progress": {
             "running": False,

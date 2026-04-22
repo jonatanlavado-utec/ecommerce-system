@@ -15,13 +15,17 @@ class FraudService:
         self.hash_set: set = set()
         self._indexed: bool = False
         self._bloom_size = bloom_size
+        self.total_indexed: int = 0  # Track total valid range
 
     def index_transactions(self, transaction_ids: list[str]) -> None:
         """Index transaction IDs for fraud detection (batch optimized)."""
         self.transaction_ids = transaction_ids
+        self.total_indexed = len(transaction_ids)
+        
         # Size bloom filter based on input size for optimal false positive rate
-        optimal_size = max(self._bloom_size, len(transaction_ids) * 10)
+        optimal_size = max(self._bloom_size, self.total_indexed * 10)
         self.bloom_filter = BloomFilter(size=optimal_size, num_hashes=7)
+        
         # Build hash set first (O(n)), then add to bloom filter in bulk
         self.hash_set = set(transaction_ids)  # O(n) bulk set creation
         for txn_id in self.hash_set:
@@ -33,7 +37,19 @@ class FraudService:
         self.transaction_ids.append(txn_id)
         self.bloom_filter.add(txn_id)
         self.hash_set.add(txn_id)
+        self.total_indexed += 1
         self._indexed = True
+
+    def _is_format_valid(self, txn_id: str) -> bool:
+        """Short-circuit check: Validate if ID format and range are possible."""
+        try:
+            if txn_id.startswith("txn_"):
+                # Extract the integer and check if it's within the known count
+                num = int(txn_id.split('_')[1])
+                return 0 <= num < self.total_indexed
+        except (IndexError, ValueError):
+            pass
+        return False
 
     def is_fraudulent_optimized(self, transaction_ids: list[str]) -> dict:
         """Check fraud using Bloom Filter - O(k) where k is number of checks."""
@@ -41,6 +57,11 @@ class FraudService:
             return {}
         results = {}
         for txn_id in transaction_ids:
+            # Short-circuit: Immediately flag as fraud if out of range or malformed
+            if not self._is_format_valid(txn_id):
+                results[txn_id] = True
+                continue
+                
             # Bloom filter: if contains returns False, definitely not in set
             # If returns True, might be in set (false positive possible)
             results[txn_id] = not self.bloom_filter.contains(txn_id)
@@ -52,6 +73,11 @@ class FraudService:
             return {}
         results = {}
         for txn_id in transaction_ids:
+            # Short-circuit: Immediately flag as fraud if out of range or malformed
+            if not self._is_format_valid(txn_id):
+                results[txn_id] = True
+                continue
+                
             results[txn_id] = txn_id not in self.hash_set
         return results
 
@@ -61,5 +87,5 @@ class FraudService:
             "bloom_filter_size": self.bloom_filter.size if self.bloom_filter else 0,
             "bloom_filter_hashes": self.bloom_filter.num_hashes if self.bloom_filter else 0,
             "hash_set_size": len(self.hash_set),
-            "transactions_indexed": len(self.transaction_ids)
+            "transactions_indexed": self.total_indexed,
         }
