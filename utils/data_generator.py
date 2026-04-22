@@ -28,6 +28,12 @@ BRANDS = [
     "ProMax", "EliteGear", "TopLine", "PrimeTech", "ElectroPro", "MaxiTech"
 ]
 
+# URLs de imágenes reutilizables (round-robin)
+IMAGE_URLS = [
+    f"https://picsum.photos/seed/{i}/300/300"
+    for i in range(1, 11)
+]
+
 
 @dataclass
 class Transaction:
@@ -55,12 +61,15 @@ def generate_product_name() -> str:
 def generate_products(count: int) -> Iterator[Product]:
     """Generate products lazily using a generator - memory efficient."""
     for i in range(count):
+        category = random.choice(CATEGORIES)
         yield Product(
             id=f"prod_{i:08d}",
             sku=generate_sku(),
             name=generate_product_name(),
             price=round(random.uniform(9.99, 2999.99), 2),
-            sales=random.randint(0, 500000)
+            sales=random.randint(0, 500000),
+            image_url=IMAGE_URLS[i % len(IMAGE_URLS)],
+            category=category
         )
 
 

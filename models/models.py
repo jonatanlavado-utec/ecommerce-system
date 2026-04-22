@@ -19,6 +19,8 @@ class Product:
     name: str
     price: float
     sales: int
+    image_url: str = ""
+    category: str = ""
 
 
 @dataclass

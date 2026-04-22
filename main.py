@@ -18,6 +18,7 @@ Endpoints:
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 import psutil
 import os
 import time
@@ -33,6 +34,36 @@ print(f"[STATE] Base dir: {BASE_DIR}")
 print(f"[STATE] State file: {STATE_FILE}")
 
 from models.models import Product, Order, OrderPriority
+
+
+# Pydantic schemas for POST requests
+class ProductCreate(BaseModel):
+    id: str = Field(..., description="Unique product ID")
+    sku: str = Field(..., description="Product SKU")
+    name: str = Field(..., description="Product name")
+    price: float = Field(..., gt=0, description="Product price")
+    sales: int = Field(default=0, ge=0, description="Number of sales")
+    image_url: str = Field(default="", description="Product image URL")
+    category: str = Field(default="", description="Product category")
+
+
+class TransactionCreate(BaseModel):
+    id: str = Field(..., description="Unique transaction ID")
+    user: str = Field(..., description="User ID")
+    amount: float = Field(..., gt=0, description="Transaction amount")
+    currency: str = Field(default="PEN", description="Currency code")
+    status: str = Field(default="clean", description="Transaction status")
+    pattern: str = Field(default="normal", description="Transaction pattern")
+    timestamp: str = Field(..., description="ISO timestamp")
+    score: float = Field(default=0.0, ge=0.0, le=1.0, description="Fraud score")
+
+
+class OrderCreate(BaseModel):
+    id: str = Field(..., description="Unique order ID")
+    customer_id: str = Field(..., description="Customer ID")
+    product_ids: list[str] = Field(..., description="List of product IDs")
+    priority: int = Field(..., ge=1, le=3, description="Priority: 1=EXPRESS, 2=STANDARD, 3=SCHEDULED")
+    total: float = Field(..., gt=0, description="Order total")
 from utils.data_generator import (
     generate_products, generate_transactions, generate_orders_from_transactions,
     estimate_memory_size
@@ -451,22 +482,33 @@ async def init_dataset_async(
 async def init_status():
     """
     Get initialization progress status.
+    When already initialized (loaded from .pkl), return counts from app_state.
     """
-    # print(f"[STATUS] Request received - running: {app_state['init_progress']['running']}, initialized: {app_state['initialized']}")
     progress = app_state["init_progress"]
+
+    # If already initialized but progress has zero totals, use app_state counts
+    if app_state["initialized"] and progress["products_total"] == 0:
+        products_done = app_state["products_count"]
+        transactions_done = app_state["transactions_count"]
+    else:
+        products_done = progress["products_done"]
+        transactions_done = int(progress["transactions_done"]) if progress["transactions_done"] else 0
+
+    products_total = progress["products_total"] if progress["products_total"] > 0 else app_state["products_count"]
+    transactions_total = progress["transactions_total"] if progress["transactions_total"] > 0 else app_state["transactions_count"]
 
     return {
         "running": progress["running"],
         "phase": progress["phase"],
         "products": {
-            "done": progress["products_done"],
-            "total": progress["products_total"],
-            "percent": round(progress["products_done"] / progress["products_total"] * 100, 1) if progress["products_total"] > 0 else 0
+            "done": products_done,
+            "total": products_total,
+            "percent": round(products_done / products_total * 100, 1) if products_total > 0 else 0
         },
         "transactions": {
-            "done": int(progress["transactions_done"]) if progress["transactions_done"] else 0,
-            "total": progress["transactions_total"],
-            "percent": round(int(progress["transactions_done"] or 0) / progress["transactions_total"] * 100, 1) if progress["transactions_total"] > 0 else 0
+            "done": transactions_done,
+            "total": transactions_total,
+            "percent": round(transactions_done / transactions_total * 100, 1) if transactions_total > 0 else 0
         },
         "error": progress["error"],
         "initialized": app_state["initialized"]
@@ -491,8 +533,21 @@ async def search_products(
         "query": q,
         "optimized": optimized,
         "count": len(results),
-        "results": [
-            {"id": p.id, "sku": p.sku, "name": p.name, "price": p.price, "sales": p.sales}
+        "items": [
+            {
+                "id": p.id,
+                "sku": p.sku,
+                "name": p.name,
+                "price": p.price,
+                "sales": p.sales,
+                "image": p.image_url,
+                "category": p.category,
+                "currency": "PEN",
+                "rating": round(3.5 + (hash(p.id) % 15) / 10, 1),
+                "reviews": hash(p.id) % 5000,
+                "origin": "PE",
+                "status": "in_stock" if p.sales > 100 else "low_stock" if p.sales > 0 else "out_of_stock"
+            }
             for p in results[:50]
         ]
     }
@@ -565,7 +620,20 @@ async def get_products(
     # 4. Construir la respuesta con el formato exacto de TypeScript
     return {
         "items": [
-            {"id": p.id, "sku": p.sku, "name": p.name, "price": p.price, "sales": p.sales}
+            {
+                "id": p.id,
+                "sku": p.sku,
+                "name": p.name,
+                "price": p.price,
+                "sales": p.sales,
+                "image": p.image_url,
+                "category": p.category,
+                "currency": "PEN",
+                "rating": round(3.5 + (hash(p.id) % 15) / 10, 1),
+                "reviews": hash(p.id) % 5000,
+                "origin": "PE",
+                "status": "in_stock" if p.sales > 100 else "low_stock" if p.sales > 0 else "out_of_stock"
+            }
             for p in items
         ],
         "page": page,
@@ -685,6 +753,110 @@ async def stats():
             "topk": "Count-Min + MinHeap",
             "fraud": "Bloom Filter",
             "orders": "Priority Heap (heapq)"
+        }
+    }
+
+
+@app.post("/api/products")
+async def create_product(product: ProductCreate):
+    """Create a new product and index it."""
+    # Create Product dataclass
+    new_product = Product(
+        id=product.id,
+        sku=product.sku,
+        name=product.name,
+        price=product.price,
+        sales=product.sales,
+        image_url=product.image_url,
+        category=product.category
+    )
+
+    # Add to in-memory list
+    app_state["products"].append(new_product)
+    app_state["products_count"] += 1
+
+    # Index in all services
+    app_state["search_service"].add_product(new_product)
+    app_state["autocomplete_service"].add_product(new_product)
+    app_state["topk_service"].add_product(new_product)
+
+    # Mark as initialized if not already
+    if not app_state["initialized"]:
+        app_state["initialized"] = True
+
+    # Persist to disk
+    save_state()
+
+    return {
+        "status": "created",
+        "product": {
+            "id": new_product.id,
+            "sku": new_product.sku,
+            "name": new_product.name,
+            "price": new_product.price,
+            "sales": new_product.sales,
+            "category": new_product.category
+        }
+    }
+
+
+@app.post("/api/transactions")
+async def create_transaction(transaction: TransactionCreate):
+    """Create a new transaction and index it."""
+    # Add to fraud detection index (Bloom Filter + Hash Set)
+    app_state["fraud_service"].add_transaction(transaction.id)
+    app_state["transactions_count"] += 1
+
+    # Mark as initialized if not already
+    if not app_state["initialized"]:
+        app_state["initialized"] = True
+
+    # Persist to disk
+    save_state()
+
+    return {
+        "status": "created",
+        "transaction": {
+            "id": transaction.id,
+            "user": transaction.user,
+            "amount": transaction.amount,
+            "currency": transaction.currency,
+            "status": transaction.status,
+            "timestamp": transaction.timestamp
+        }
+    }
+
+
+@app.post("/api/orders")
+async def create_order(order: OrderCreate):
+    """Create a new order and index it."""
+    # Create Order dataclass
+    new_order = Order(
+        id=order.id,
+        customer_id=order.customer_id,
+        product_ids=order.product_ids,
+        priority=OrderPriority(order.priority),
+        total=order.total
+    )
+
+    # Add to order service (Priority Heap)
+    app_state["order_service"].add_order(new_order)
+
+    # Mark as initialized if not already
+    if not app_state["initialized"]:
+        app_state["initialized"] = True
+
+    # Persist to disk
+    save_state()
+
+    return {
+        "status": "created",
+        "order": {
+            "id": new_order.id,
+            "customer_id": new_order.customer_id,
+            "product_ids": new_order.product_ids,
+            "priority": OrderPriority(new_order.priority).name,
+            "total": new_order.total
         }
     }
 
