@@ -1,114 +1,131 @@
-"""LSM (Log-Structured Merge) debug/simulation service."""
+"""LSM (Log-Structured Merge) Tree Tracker."""
 
+import time
 import random
-from datetime import datetime, timedelta
-
+import uuid
+from datetime import datetime
 
 class LSMDebugService:
-    """Simulate LSM tree behavior for educational purposes."""
+    """Tracks real inserts and simulates LSM tree flushes and compactions based on actual data volume."""
 
-    def __init__(self):
+    def __init__(self, memtable_limit_mb: float = 2.0):
+        self.memtable_limit_bytes = memtable_limit_mb * 1024 * 1024
+        self.memtable_current_bytes = 0
+        self.memtable_entries = 0
+        
         self.levels = []
-        self.sstables = []
-        self.compaction_events = []
         self.max_levels = 7
-        self.max_sstables_per_level = 10
-
-        # Initialize levels
+        self.compaction_events = []
+        
+        # Initialize LSM Levels
         for i in range(self.max_levels):
             self.levels.append({
                 "level": i,
                 "name": f"L{i}",
-                "max_size_mb": 10 * (2 ** i),  # Each level 10x larger
-                "current_size_mb": 0,
+                # Level limits: L1=10MB, L2=100MB, L3=1GB...
+                "max_size_bytes": (10 * (10 ** i)) * 1024 * 1024 if i > 0 else 0,
+                "current_size_bytes": 0,
                 "sstables": []
             })
 
-    def add_sstable(self, level: int, sstable_id: str, size_mb: float) -> None:
-        """Simulate adding an SSTable to a level."""
-        if level >= len(self.levels):
-            return
+    def insert(self, key: str, size_bytes: int) -> None:
+        """Track a real insertion. Triggers flushes if memtable fills up."""
+        self.memtable_current_bytes += size_bytes
+        self.memtable_entries += 1
+        
+        # If MemTable exceeds the limit, flush to Level 0
+        if self.memtable_current_bytes >= self.memtable_limit_bytes:
+            self._flush_memtable(trigger_key=key)
 
+    def _log_event(self, event_type: str, level: int, size_bytes: float, entries: int, key: str = None) -> None:
+        """Add an event to the timeline log."""
+        self.compaction_events.append({
+            "id": f"evt-{uuid.uuid4().hex[:8]}",
+            "timestamp": datetime.now().isoformat(),
+            "event": event_type,
+            "level": level,
+            "details": {
+                "size_mb": size_bytes / (1024 * 1024),
+                "entries_written": entries,
+                "key": key
+            }
+        })
+        # Keep only recent events so the memory/UI doesn't blow up
+        if len(self.compaction_events) > 50:
+            self.compaction_events.pop(0)
+
+    def _flush_memtable(self, trigger_key: str) -> None:
+        """Flush MemTable to an SSTable in Level 0."""
+        sstable_size = self.memtable_current_bytes
+        entries = self.memtable_entries
+        
+        self._log_event("flush_memtable", 0, sstable_size, entries, trigger_key)
+        self._add_sstable(0, sstable_size, entries)
+        
+        # Reset MemTable
+        self.memtable_current_bytes = 0
+        self.memtable_entries = 0
+        
+        # Cascading compaction check for Level 0
+        self._check_compaction(0)
+
+    def _add_sstable(self, level_idx: int, size_bytes: float, entries: int) -> None:
+        """Add an SSTable to a specific level."""
         sstable = {
-            "id": sstable_id,
-            "size_mb": size_mb,
-            "key_count": random.randint(1000, 100000),
+            "id": f"SST_{level_idx}_{int(time.time()*1000)}_{random.randint(0,999)}",
+            "size_mb": size_bytes / (1024 * 1024),
+            "size_bytes": size_bytes,
+            "entries": entries,
             "created_at": datetime.now().isoformat()
         }
-        self.levels[level]["sstables"].append(sstable)
-        self.levels[level]["current_size_mb"] += size_mb
-        self.sstables.append(sstable)
+        self.levels[level_idx]["sstables"].append(sstable)
+        self.levels[level_idx]["current_size_bytes"] += size_bytes
 
-        # Simulate compaction if level is full
-        if len(self.levels[level]["sstables"]) > self.max_sstables_per_level:
-            self._trigger_compaction(level)
-
-    def _trigger_compaction(self, level: int) -> None:
-        """Simulate compaction event."""
-        if level >= self.max_levels - 1:
+    def _check_compaction(self, level_idx: int) -> None:
+        """Check if a level needs compaction and recursively compact downwards."""
+        if level_idx >= self.max_levels - 1:
             return
-
-        event = {
-            "timestamp": datetime.now().isoformat(),
-            "type": "compaction",
-            "source_level": level,
-            "target_level": level + 1,
-            "sstables_merged": len(self.levels[level]["sstables"]),
-            "size_mb": self.levels[level]["current_size_mb"]
-        }
-        self.compaction_events.append(event)
-
-        # Move SSTables to next level
-        self.levels[level]["sstables"].clear()
-        self.levels[level]["current_size_mb"] = 0
-
-    def generate_simulated_state(self, num_sstables: int = 50) -> dict:
-        """Generate a simulated LSM state for visualization."""
-        self.compaction_events = []
-        for level in self.levels:
+            
+        level = self.levels[level_idx]
+        needs_compaction = False
+        
+        # L0 compacts based on file count, other levels base on total size limit
+        if level_idx == 0 and len(level["sstables"]) >= 4:
+            needs_compaction = True
+        elif level_idx > 0 and level["current_size_bytes"] > level["max_size_bytes"]:
+            needs_compaction = True
+            
+        if needs_compaction:
+            total_size = level["current_size_bytes"]
+            total_entries = sum(s["entries"] for s in level["sstables"])
+            
+            self._log_event("compaction", level_idx + 1, total_size, total_entries)
+            
+            # Clear current level
             level["sstables"] = []
-            level["current_size_mb"] = 0
-
-        # Populate with random SSTables
-        for i in range(num_sstables):
-            level = min(i // self.max_sstables_per_level, self.max_levels - 1)
-            size = random.uniform(0.5, 5.0)
-            self.add_sstable(level, f"SST_{i:04d}", size)
-
-        return self.get_state()
-
+            level["current_size_bytes"] = 0
+            
+            # Push the merged SSTable down to the next level
+            self._add_sstable(level_idx + 1, total_size, total_entries)
+            
+            # Cascading check for the next level
+            self._check_compaction(level_idx + 1)
+            
     def get_state(self) -> dict:
-        """Get current LSM state."""
+        """Return the current tree state formatted for the API."""
+        levels_formatted = []
+        for l in self.levels:
+            levels_formatted.append({
+                "level": l["level"],
+                "current_size_mb": l["current_size_bytes"] / (1024 * 1024),
+                "sstables": l["sstables"]
+            })
+            
         return {
-            "levels": self.levels,
-            "total_sstables": len(self.sstables),
-            "total_size_mb": sum(s["size_mb"] for s in self.sstables),
-            "compaction_events": self.compaction_events[-10:],  # Last 10 events
+            "levels": levels_formatted,
             "timestamp": datetime.now().isoformat()
         }
 
     def get_timeline(self) -> list[dict]:
-        """Get timeline of simulated events."""
-        timeline = []
-
-        # Generate initial compaction events
-        for i in range(20):
-            event_time = datetime.now() - timedelta(hours=random.randint(1, 48))
-            timeline.append({
-                "timestamp": event_time.isoformat(),
-                "event": random.choice([
-                    "flush_memtable",
-                    "level_compaction",
-                    "minor_compaction",
-                    "major_compaction"
-                ]),
-                "level": random.randint(0, self.max_levels - 1),
-                "details": {
-                    "entries_written": random.randint(10000, 500000),
-                    "entries_removed": random.randint(0, 10000),
-                    "size_mb": round(random.uniform(1.0, 100.0), 2)
-                }
-            })
-
-        timeline.sort(key=lambda x: x["timestamp"], reverse=True)
-        return timeline[:20]
+        """Return the recent timeline events."""
+        return self.compaction_events
