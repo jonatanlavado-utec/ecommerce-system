@@ -41,6 +41,7 @@ class BenchmarkService:
 
     def __init__(self, app_state: dict):
         self.app_state = app_state
+        self._cache = None
 
     def run_search_benchmark(self) -> dict:
         """Benchmark search with optimized vs non-optimized."""
@@ -304,7 +305,7 @@ class BenchmarkService:
             prefix_query = "sku-10"
             
             # Optimized: B+ Tree bisects down to the start node, then walks the leaves - O(log n + k)
-            opt_r = benchmark_function(lambda: s_svc.search_by_sku_optimized(prefix_query), iterations=10)
+            opt_r = benchmark_function(lambda: s_svc.search_optimized(prefix_query), iterations=10)
             
             # Baseline: Linear Scan must evaluate every single product - O(n)
             lin_r = benchmark_function(lambda: [p for p in subset if p.sku.lower().startswith(prefix_query)][:100], iterations=10)

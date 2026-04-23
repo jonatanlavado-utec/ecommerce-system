@@ -24,14 +24,17 @@ import os
 import time
 import pickle
 import json
+from typing import Optional
 
 # Persistence file path (in data/ directory)
 import pathlib
 BASE_DIR = pathlib.Path(__file__).parent.resolve()
 STATE_FILE = BASE_DIR / "data" / "app_state.pkl"
+BENCHMARK_FILE = BASE_DIR / "data" / "benchmark_cache.json"
 
 print(f"[STATE] Base dir: {BASE_DIR}")
 print(f"[STATE] State file: {STATE_FILE}")
+print(f"[STATE] Benchmark file: {BENCHMARK_FILE}")
 
 from models.models import Product, Order, OrderPriority
 
@@ -201,6 +204,46 @@ def load_state():
 
 # Try to load saved state on startup
 _loaded = load_state()
+
+
+def save_benchmark_cache(benchmark_data: dict) -> None:
+    """Save benchmark results to disk for fast retrieval."""
+    try:
+        BENCHMARK_FILE.parent.mkdir(parents=True, exist_ok=True)
+        with open(BENCHMARK_FILE, "w") as f:
+            json.dump(benchmark_data, f)
+        print(f"[BENCHMARK] Cached benchmark results")
+    except Exception as e:
+        print(f"[BENCHMARK] Cache save FAILED: {e}")
+
+
+def load_benchmark_cache() -> Optional[dict]:
+    """Load cached benchmark results if they exist."""
+    if not os.path.exists(BENCHMARK_FILE):
+        return None
+    try:
+        with open(BENCHMARK_FILE, "r") as f:
+            return json.load(f)
+    except Exception as e:
+        print(f"[BENCHMARK] Cache load FAILED: {e}")
+        return None
+
+
+def generate_and_cache_benchmark() -> dict:
+    """Generate benchmark and cache the results."""
+    benchmark_service = BenchmarkService(app_state)
+    results = benchmark_service.run_full_benchmark()
+    # Also generate scaling comparisons
+    try:
+        scaling = benchmark_service.run_scaling_comparisons()
+        results["scaling_comparisons"] = scaling
+    except Exception as e:
+        print(f"[BENCHMARK] Scaling comparison failed: {e}")
+        results["scaling_comparisons"] = []
+
+    # Cache the results
+    save_benchmark_cache(results)
+    return results
 
 
 @app.get("/")
@@ -703,15 +746,20 @@ async def priority_orders(
 
 
 @app.get("/api/benchmark")
-async def benchmark():
+async def benchmark(regenerate: bool = Query(default=False, description="Force regenerate benchmark")):
     """Run full benchmark comparing optimized vs non-optimized implementations."""
     if not app_state["initialized"]:
         raise HTTPException(status_code=400, detail="Call /init first")
 
-    benchmark_service = BenchmarkService(app_state)
-    results = benchmark_service.run_full_benchmark()
+    # Check for cached benchmark first (unless regenerate is requested)
+    if not regenerate:
+        cached = load_benchmark_cache()
+        if cached:
+            print("[BENCHMARK] Returning cached benchmark results")
+            return cached
 
-    return results
+    # Generate new benchmark and cache it
+    return generate_and_cache_benchmark()
 
 
 @app.get("/api/lsm-debug")

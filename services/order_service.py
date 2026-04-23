@@ -51,21 +51,37 @@ class OrderService:
         end = start + limit
 
         all_sorted = heapq.nsmallest(end, self.priority_heap, key=lambda x: (x[0], x[1]))
-        
+
         page_orders = []
         seen = set()
-        
+
+        # Map priority to SLA
+        priority_to_sla = {1: "P0", 2: "P1", 3: "P2"}
+        # Extract region from customer_id (e.g., "user_12345" -> "PE" based on hash)
+        regions = ["PE", "US", "BR", "MX", "CO", "CL", "AR"]
+
         for priority, counter, order in all_sorted:
             # ---> UPDATE THIS: Skip stale orders
             if order.id in seen or self.active_orders.get(order.id) is not order:
                 continue
             seen.add(order.id)
+
+            # Generate timestamp from order id (deterministic)
+            order_num = int(order.id.split('_')[-1]) if '_' in order.id else hash(order.id)
+            timestamp = 1700000000 + (order_num % 1700000000)  # Timestamp within range
+
+            # Generate region from customer_id hash
+            region_idx = hash(order.customer_id) % len(regions)
+
             page_orders.append({
                 "id": order.id,
-                "customer_id": order.customer_id,
-                "product_ids": order.product_ids,
-                "priority": OrderPriority(priority).name,
-                "total": order.total
+                "customer": order.customer_id,
+                "priority": priority,
+                "sla": priority_to_sla.get(priority, "P3"),
+                "total": order.total,
+                "amount": order.total,
+                "timestamp": str(timestamp),
+                "region": regions[region_idx]
             })
 
         # Correct pagination slice after filtering

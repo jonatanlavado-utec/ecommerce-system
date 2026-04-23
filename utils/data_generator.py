@@ -28,11 +28,10 @@ BRANDS = [
     "ProMax", "EliteGear", "TopLine", "PrimeTech", "ElectroPro", "MaxiTech"
 ]
 
-# URLs de imágenes reutilizables (round-robin)
-IMAGE_URLS = [
-    f"https://picsum.photos/seed/{i}/300/300"
-    for i in range(1, 11)
-]
+# Generate unique image URL per product using product index as seed
+def get_image_url(index: int) -> str:
+    """Generate a unique image URL for each product using its index as seed."""
+    return f"https://picsum.photos/seed/{index}/300/300"
 
 
 @dataclass
@@ -68,7 +67,7 @@ def generate_products(count: int) -> Iterator[Product]:
             name=generate_product_name(),
             price=round(random.uniform(9.99, 2999.99), 2),
             sales=random.randint(0, 500000),
-            image_url=IMAGE_URLS[i % len(IMAGE_URLS)],
+            image_url=get_image_url(i),
             category=category
         )
 
